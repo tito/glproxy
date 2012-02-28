@@ -6,10 +6,6 @@
 #include <unistd.h>
 #include <assert.h>
 
-//-----------------------------------------------------------------------------
-// QUEUES
-//-----------------------------------------------------------------------------
-
 int server_port = 8888;
 pthread_mutex_t qfuncmtx = PTHREAD_MUTEX_INITIALIZER;
 
@@ -17,6 +13,10 @@ enum demo_protocols {
 	PROTOCOL_GLPROXY,
 	DEMO_PROTOCOL_COUNT
 };
+
+//-----------------------------------------------------------------------------
+// QUEUES FUNC
+//-----------------------------------------------------------------------------
 
 typedef struct s_func_args_t {
 	int size;
@@ -26,7 +26,6 @@ typedef struct s_func_args_t {
 
 typedef struct s_func_t {
 	char name[64];
-	int argc;
 	func_args_t *args;
 	func_args_t *argst;
 	struct s_func_t *next;
@@ -39,7 +38,6 @@ func_t *f_create(char *name) {
 	func_t *func;
 	func = malloc(sizeof(func_t));
 	strcpy(func->name, name);
-	func->argc = 0;
 	func->next = NULL;
 	func->args = NULL;
 	func->argst = NULL;
@@ -85,16 +83,20 @@ void f_push(func_t *func) {
 func_t *f_pop() {
 	func_t *func;
 	pthread_mutex_lock(&qfuncmtx);
+	printf("==> POP, queue is %p\n", qfunc);
 	if ( qfunc == NULL ) {
 		pthread_mutex_unlock(&qfuncmtx);
 		return NULL;
 	}
+	printf("==> POP, queue next is %p\n", qfunc->next);
+	printf("==> POP, queue tail is %p\n", qfunct);
 	func = qfunc;
 	qfunc = qfunc->next;
 	if ( qfunc == NULL )
 		qfunct = NULL;
 	qlen --;
 	pthread_mutex_unlock(&qfuncmtx);
+	printf("==< POP, return %p\n", func);
 	return func;
 }
 
@@ -111,6 +113,53 @@ void f_free(func_t *func) {
 }
 
 //-----------------------------------------------------------------------------
+// SHADER LOCATION REGISTER
+//-----------------------------------------------------------------------------
+
+typedef struct s_loc_t {
+	int program;
+	char name[64];
+	int index;
+	struct s_loc_t *next;
+} loc_t;
+
+int loc_index = 1;
+loc_t *locs = NULL;
+
+static loc_t *loc_create(int program, const char *name) {
+	loc_t *loc = malloc(sizeof(loc_t));
+	strlcpy(loc->name, name, 64);
+	loc->index = loc_index++;
+	loc->program = program;
+	loc->next = locs;
+	locs = loc;
+	return loc;
+}
+
+static loc_t *loc_search(int program, int location) {
+	loc_t *loc = locs;
+	while ( loc ) {
+		if ( loc->program == program && loc->index == location )
+			break;
+		loc = loc->next;
+	}
+	return loc;
+}
+
+static void loc_flush(int program) {
+	loc_t *loc = locs, *tmp;
+	while ( loc ) {
+		tmp = loc->next;
+		if ( loc->program == program ) {
+			if ( loc == locs )
+				locs = tmp;
+			free(loc);
+		}
+		loc = tmp;
+	}
+}
+
+//-----------------------------------------------------------------------------
 // OPENGL REDIRECTION
 //-----------------------------------------------------------------------------
 
@@ -123,17 +172,31 @@ void f_free(func_t *func) {
 #define GL_SHADING_LANGUAGE_VERSION       0x8B8C
 #define GL_LINK_STATUS                    0x8B82
 
+#define GL_DEPTH_COMPONENT                0x1902
+#define GL_ALPHA                          0x1906
+#define GL_LUMINANCE                      0x1909
+#define GL_LUMINANCE_ALPHA                0x190A
+#define GL_RGB                            0x1907
+#define GL_RGBA                           0x1908
+
+#define GL_BYTE                           0x1400
+#define GL_UNSIGNED_BYTE                  0x1401
+#define GL_SHORT                          0x1402
+#define GL_UNSIGNED_SHORT                 0x1403
+#define GL_INT                            0x1404
+#define GL_UNSIGNED_INT                   0x1405
+#define GL_FLOAT                          0x1406
+#define GL_FIXED                          0x140C
+
 typedef void            GLvoid;
 typedef char            GLchar;
 typedef unsigned int    GLenum;
 typedef unsigned char   GLboolean;
 typedef unsigned int    GLbitfield;
 typedef signed char     GLbyte;
-typedef short           GLshort;
 typedef int             GLint;
 typedef int             GLsizei;
 typedef unsigned char   GLubyte;
-typedef unsigned short  GLushort;
 typedef unsigned int    GLuint;
 typedef float           GLfloat;
 typedef float           GLclampf;
@@ -146,10 +209,11 @@ typedef long            GLsizeiptr;
 
 static unsigned int _gl_program = 1;
 static unsigned int _gl_shader = 1;
-static unsigned int _gl_buffers = 0;
-static unsigned int _gl_framebuffers = 0;
-static unsigned int _gl_renderbuffers = 0;
-static unsigned int _gl_textures = 0;
+static unsigned int _gl_buffers = 1;
+static unsigned int _gl_framebuffers = 1;
+static unsigned int _gl_renderbuffers = 1;
+static unsigned int _gl_textures = 1;
+static unsigned int _gl_current_program = 0;
 
 void         glActiveTexture (GLenum texture) {
 	printf("--> glActiveTexture ()\n");
@@ -171,7 +235,7 @@ void         glBindAttribLocation (GLuint program, GLuint index, const GLchar* n
 	func_t *func = f_create("glBindAttribLocation");
 	f_append(func, sizeof(GLuint), &program);
 	f_append(func, sizeof(GLuint), &index);
-	f_append(func, strlen(name) + 1, name);
+	f_append(func, strlen(name), (void *)name);
 	f_push(func);
 }
 
@@ -255,7 +319,7 @@ void         glBufferData (GLenum target, GLsizeiptr size, const GLvoid* data, G
 	func_t *func = f_create("glBufferData");
 	f_append(func, sizeof(GLenum), &target);
 	f_append(func, sizeof(GLsizeiptr), &size);
-	f_append(func, size, data);
+	f_append(func, size, (void *)data);
 	f_append(func, sizeof(GLenum), &usage);
 	f_push(func);
 }
@@ -266,7 +330,7 @@ void         glBufferSubData (GLenum target, GLintptr offset, GLsizeiptr size, c
 	f_append(func, sizeof(GLenum), &target);
 	f_append(func, sizeof(GLintptr), &offset);
 	f_append(func, sizeof(GLsizeiptr), &size);
-	f_append(func, size, data);
+	f_append(func, size, (void *)data);
 	f_push(func);
 }
 
@@ -310,10 +374,10 @@ void         glClearStencil (GLint s) {
 void         glColorMask (GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha) {
 	printf("--> glColorMask ()\n");
 	func_t *func = f_create("glColorMask");
-	f_append(func, sizeof(GLclampf), &red);
-	f_append(func, sizeof(GLclampf), &green);
-	f_append(func, sizeof(GLclampf), &blue);
-	f_append(func, sizeof(GLclampf), &alpha);
+	f_append(func, sizeof(GLboolean), &red);
+	f_append(func, sizeof(GLboolean), &green);
+	f_append(func, sizeof(GLboolean), &blue);
+	f_append(func, sizeof(GLboolean), &alpha);
 	f_push(func);
 }
 
@@ -366,42 +430,92 @@ void         glCullFace (GLenum mode) {
 
 void         glDeleteBuffers (GLsizei n, const GLuint* buffers) {
 	printf("--> glDeleteBuffers ()\n");
+	int i;
+	func_t *func;
+	for (i = 0; i < n; i++) {
+		func = f_create("glDeleteBuffers");
+		f_append(func, sizeof(GLuint), (void *)&buffers[i]);
+		f_push(func);
+	}
 }
 
 void         glDeleteFramebuffers (GLsizei n, const GLuint* framebuffers) {
 	printf("--> glDeleteFramebuffers ()\n");
+	int i;
+	func_t *func;
+	for (i = 0; i < n; i++) {
+		func = f_create("glDeleteFramebuffers");
+		f_append(func, sizeof(GLuint), &framebuffers[i]);
+		f_push(func);
+	}
 }
 
 void         glDeleteProgram (GLuint program) {
 	printf("--> glDeleteProgram ()\n");
+	int i;
+	func_t *func = f_create("glDeleteProgram");
+	f_append(func, sizeof(GLuint), &program);
+	f_push(func);
+	loc_flush(program);
 }
 
 void         glDeleteRenderbuffers (GLsizei n, const GLuint* renderbuffers) {
 	printf("--> glDeleteRenderbuffers ()\n");
+	int i;
+	func_t *func;
+	for (i = 0; i < n; i++) {
+		func = f_create("glDeleteRenderbuffers");
+		f_append(func, sizeof(GLuint), &renderbuffers[i]);
+		f_push(func);
+	}
 }
 
 void         glDeleteShader (GLuint shader) {
 	printf("--> glDeleteShader ()\n");
+	func_t *func = f_create("glDeleteShader");
+	f_append(func, sizeof(GLuint), &shader);
+	f_push(func);
 }
 
 void         glDeleteTextures (GLsizei n, const GLuint* textures) {
 	printf("--> glDeleteTextures ()\n");
+	int i;
+	func_t *func;
+	for (i = 0; i < n; i++) {
+		func = f_create("glDeleteTextures");
+		f_append(func, sizeof(GLuint), &textures[i]);
+		f_push(func);
+	}
 }
 
-void         glDepthFunc (GLenum func) {
+void         glDepthFunc (GLenum _func) {
 	printf("--> glDepthFunc ()\n");
+	func_t *func = f_create("glDepthFunc");
+	f_append(func, sizeof(GLenum), &_func);
+	f_push(func);
 }
 
 void         glDepthMask (GLboolean flag) {
 	printf("--> glDepthMask ()\n");
+	func_t *func = f_create("glDepthMask");
+	f_append(func, sizeof(GLboolean), &flag);
+	f_push(func);
 }
 
 void         glDepthRangef (GLclampf zNear, GLclampf zFar) {
 	printf("--> glDepthRangef ()\n");
+	func_t *func = f_create("glDepthRangef");
+	f_append(func, sizeof(GLclampf), &zNear);
+	f_append(func, sizeof(GLclampf), &zFar);
+	f_push(func);
 }
 
 void         glDetachShader (GLuint program, GLuint shader) {
 	printf("--> glDetachShader ()\n");
+	func_t *func = f_create("glDetachShader");
+	f_append(func, sizeof(GLuint), &program);
+	f_append(func, sizeof(GLuint), &shader);
+	f_push(func);
 }
 
 void         glDisable (GLenum cap) {
@@ -429,6 +543,14 @@ void         glDrawArrays (GLenum mode, GLint first, GLsizei count) {
 
 void         glDrawElements (GLenum mode, GLsizei count, GLenum type, const GLvoid* indices) {
 	printf("--> glDrawElements ()\n");
+	int size = count * 2;
+	assert(type == GL_UNSIGNED_SHORT);
+	func_t *func = f_create("glDrawElements");
+	f_append(func, sizeof(GLenum), &mode);
+	f_append(func, sizeof(GLsizei), &count);
+	f_append(func, sizeof(GLenum), &type);
+	f_append(func, size, indices);
+	f_push(func);
 }
 
 void         glEnable (GLenum cap) {
@@ -440,6 +562,9 @@ void         glEnable (GLenum cap) {
 
 void         glEnableVertexAttribArray (GLuint index) {
 	printf("--> glEnableVertexAttribArray ()\n");
+	func_t *func = f_create("glEnableVertexAttribArray");
+	f_append(func, sizeof(GLuint), &index);
+	f_push(func);
 }
 
 void         glFinish (void) {
@@ -456,49 +581,73 @@ void         glFlush (void) {
 
 void         glFramebufferRenderbuffer (GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {
 	printf("--> glFramebufferRenderbuffer ()\n");
+	assert(0);
 }
 
 void         glFramebufferTexture2D (GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
 	printf("--> glFramebufferTexture2D ()\n");
+	assert(0);
 }
 
 void         glFrontFace (GLenum mode) {
 	printf("--> glFrontFace ()\n");
+	func_t *func = f_create("glFrontFace");
+	f_append(func, sizeof(GLenum), &mode);
+	f_push(func);
 }
 
 void         glGenBuffers (GLsizei n, GLuint* buffers) {
 	printf("--> glGenBuffers ()\n");
 	int i;
-	for (i = 0; i < n; i++)
+	func_t *func;
+	for (i = 0; i < n; i++) {
 		buffers[i] = _gl_buffers + i;
+		func = f_create("glGenBuffers");
+		f_push(func);
+	}
 	_gl_buffers += n;
 }
 
 void         glGenerateMipmap (GLenum target) {
 	printf("--> glGenerateMipmap ()\n");
+	func_t *func = f_create("glGenerateMipmap");
+	f_append(func, sizeof(GLenum), &target);
+	f_push(func);
 }
 
 void         glGenFramebuffers (GLsizei n, GLuint* framebuffers) {
 	printf("--> glGenFramebuffers ()\n");
 	int i;
-	for (i = 0; i < n; i++)
+	func_t *func;
+	for (i = 0; i < n; i++) {
 		framebuffers[i] = _gl_framebuffers + i;
+		func = f_create("glGenBuffers");
+		f_push(func);
+	}
 	_gl_framebuffers += n;
 }
 
 void         glGenRenderbuffers (GLsizei n, GLuint* renderbuffers) {
 	printf("--> glGenRenderbuffers ()\n");
 	int i;
-	for (i = 0; i < n; i++)
+	func_t *func;
+	for (i = 0; i < n; i++) {
 		renderbuffers[i] = _gl_renderbuffers + i;
+		func = f_create("glGenRenderbuffers");
+		f_push(func);
+	}
 	_gl_renderbuffers += n;
 }
 
 void         glGenTextures (GLsizei n, GLuint* textures) {
 	printf("--> glGenTextures ()\n");
 	int i;
-	for (i = 0; i < n; i++)
+	func_t *func;
+	for (i = 0; i < n; i++) {
 		textures[i] = _gl_textures + i;
+		func = f_create("glGenTextures");
+		f_push(func);
+	}
 	_gl_textures += n;
 }
 
@@ -541,7 +690,7 @@ void         glGetFramebufferAttachmentParameteriv (GLenum target, GLenum attach
 
 void         glGetIntegerv (GLenum pname, GLint* params) {
 	printf("--> glGetIntegerv ()\n");
-	*params = NULL;
+	*params = 0;
 	if ( pname == GL_MAX_TEXTURE_SIZE )
 		*params = 4096;
 	else if ( pname == GL_MAX_TEXTURE_IMAGE_UNITS )
@@ -550,12 +699,15 @@ void         glGetIntegerv (GLenum pname, GLint* params) {
 
 void         glGetProgramiv (GLuint program, GLenum pname, GLint* params) {
 	printf("--> glGetProgramiv ()\n");
+	*params = 0;
 	if (pname == GL_LINK_STATUS)
 		*params = 1;
 }
 
 void         glGetProgramInfoLog (GLuint program, GLsizei bufsize, GLsizei* length, GLchar* infolog) {
 	printf("--> glGetProgramInfoLog ()\n");
+	if ( length )
+		*length = 0;
 }
 
 void         glGetRenderbufferParameteriv (GLenum target, GLenum pname, GLint* params) {
@@ -564,12 +716,15 @@ void         glGetRenderbufferParameteriv (GLenum target, GLenum pname, GLint* p
 
 void         glGetShaderiv (GLuint shader, GLenum pname, GLint* params) {
 	printf("--> glGetShaderiv ()\n");
+	*params = 0;
 	if (pname == GL_COMPILE_STATUS)
 		*params = 1;
 }
 
 void         glGetShaderInfoLog (GLuint shader, GLsizei bufsize, GLsizei* length, GLchar* infolog) {
 	printf("--> glGetShaderInfoLog ()\n");
+	if ( length )
+		*length = 0;
 }
 
 void         glGetShaderPrecisionFormat (GLenum shadertype, GLenum precisiontype, GLint* range, GLint* precision) {
@@ -618,6 +773,10 @@ void         glGetUniformiv (GLuint program, GLint location, GLint* params) {
 
 int          glGetUniformLocation (GLuint program, const GLchar* name) {
 	printf("--> glGetUniformLocation ()\n");
+	loc_t *loc = loc_search(program, name);
+	if (loc == NULL)
+		loc = loc_create(program, name);
+	return loc->index;
 }
 
 void         glGetVertexAttribfv (GLuint index, GLenum pname, GLfloat* params) {
@@ -634,250 +793,621 @@ void         glGetVertexAttribPointerv (GLuint index, GLenum pname, GLvoid** poi
 
 void         glHint (GLenum target, GLenum mode) {
 	printf("--> glHint ()\n");
+	func_t *func = f_create("glHint");
+	f_append(func, sizeof(GLenum), &target);
+	f_append(func, sizeof(GLenum), &mode);
+	f_push(func);
 }
 
 GLboolean    glIsBuffer (GLuint buffer) {
 	printf("--> glIsBuffer ()\n");
+	return 1;
 }
 
 GLboolean    glIsEnabled (GLenum cap) {
 	printf("--> glIsEnabled ()\n");
+	return 1;
 }
 
 GLboolean    glIsFramebuffer (GLuint framebuffer) {
 	printf("--> glIsFramebuffer ()\n");
+	return 1;
 }
 
 GLboolean    glIsProgram (GLuint program) {
 	printf("--> glIsProgram ()\n");
+	return 1;
 }
 
 GLboolean    glIsRenderbuffer (GLuint renderbuffer) {
 	printf("--> glIsRenderbuffer ()\n");
+	return 1;
 }
 
 GLboolean    glIsShader (GLuint shader) {
 	printf("--> glIsShader ()\n");
+	return 1;
 }
 
 GLboolean    glIsTexture (GLuint texture) {
 	printf("--> glIsTexture ()\n");
+	return 1;
 }
 
 void         glLineWidth (GLfloat width) {
 	printf("--> glLineWidth ()\n");
+	func_t *func = f_create("glLineWidth");
+	f_append(func, sizeof(GLfloat), &width);
+	f_push(func);
 }
 
 void         glLinkProgram (GLuint program) {
 	printf("--> glLinkProgram ()\n");
+	func_t *func = f_create("glLinkProgram");
+	f_append(func, sizeof(GLuint), &program);
+	f_push(func);
 }
 
 void         glPixelStorei (GLenum pname, GLint param) {
 	printf("--> glPixelStorei ()\n");
+	func_t *func = f_create("glPixelStorei");
+	f_append(func, sizeof(GLenum), &pname);
+	f_append(func, sizeof(GLint), &param);
+	f_push(func);
 }
 
 void         glPolygonOffset (GLfloat factor, GLfloat units) {
 	printf("--> glPolygonOffset ()\n");
+	func_t *func = f_create("glPolygonOffset");
+	f_append(func, sizeof(GLfloat), &factor);
+	f_append(func, sizeof(GLfloat), &units);
+	f_push(func);
 }
 
 void         glReadPixels (GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLvoid* pixels) {
 	printf("--> glReadPixels ()\n");
+	*(char *)pixels = NULL;
 }
 
 void         glReleaseShaderCompiler (void) {
 	printf("--> glReleaseShaderCompiler ()\n");
+	func_t *func = f_create("glReleaseShaderCompiler");
+	f_push(func);
 }
 
 void         glRenderbufferStorage (GLenum target, GLenum internalformat, GLsizei width, GLsizei height) {
 	printf("--> glRenderbufferStorage ()\n");
+	func_t *func = f_create("glRenderbufferStorage");
+	f_append(func, sizeof(GLenum), &target);
+	f_append(func, sizeof(GLenum), &internalformat);
+	f_append(func, sizeof(GLsizei), &width);
+	f_append(func, sizeof(GLsizei), &height);
+	f_push(func);
 }
 
 void         glSampleCoverage (GLclampf value, GLboolean invert) {
 	printf("--> glSampleCoverage ()\n");
+	func_t *func = f_create("glSampleCoverage");
+	f_append(func, sizeof(GLclampf), &value);
+	f_append(func, sizeof(GLboolean), &invert);
+	f_push(func);
 }
 
 void         glScissor (GLint x, GLint y, GLsizei width, GLsizei height) {
 	printf("--> glScissor ()\n");
+	func_t *func = f_create("glScissor");
+	f_append(func, sizeof(GLint), &x);
+	f_append(func, sizeof(GLint), &y);
+	f_append(func, sizeof(GLsizei), &width);
+	f_append(func, sizeof(GLsizei), &height);
+	f_push(func);
 }
 
 void         glShaderBinary (GLsizei n, const GLuint* shaders, GLenum binaryformat, const GLvoid* binary, GLsizei length) {
 	printf("--> glShaderBinary ()\n");
+	assert(0);
 }
 
 void         glShaderSource (GLuint shader, GLsizei count, const GLchar** string, const GLint* length) {
 	printf("--> glShaderSource ()\n");
+	assert(count == 1);
+	func_t *func = f_create("glShaderSource");
+	f_append(func, sizeof(GLuint), &shader);
+	f_append(func, sizeof(GLsizei), &count);
+	f_append(func, strlen(string[0]), string[0]);
+	//f_append(func, sizeof(GLint) * count, &length);
+	f_push(func);
 }
 
-void         glStencilFunc (GLenum func, GLint ref, GLuint mask) {
+void         glStencilFunc (GLenum _func, GLint ref, GLuint mask) {
 	printf("--> glStencilFunc ()\n");
+	func_t *func = f_create("glStencilFunc");
+	f_append(func, sizeof(GLenum), &_func);
+	f_append(func, sizeof(GLint), &ref);
+	f_append(func, sizeof(GLuint), &mask);
+	f_push(func);
 }
 
-void         glStencilFuncSeparate (GLenum face, GLenum func, GLint ref, GLuint mask) {
+void         glStencilFuncSeparate (GLenum face, GLenum _func, GLint ref, GLuint mask) {
 	printf("--> glStencilFuncSeparate ()\n");
+	func_t *func = f_create("glStencilFuncSeparate");
+	f_append(func, sizeof(GLenum), &face);
+	f_append(func, sizeof(GLenum), &_func);
+	f_append(func, sizeof(GLint), &ref);
+	f_append(func, sizeof(GLuint), &mask);
+	f_push(func);
 }
 
 void         glStencilMask (GLuint mask) {
 	printf("--> glStencilMask ()\n");
+	func_t *func = f_create("glStencilMask");
+	f_append(func, sizeof(GLuint), &mask);
+	f_push(func);
 }
 
 void         glStencilMaskSeparate (GLenum face, GLuint mask) {
 	printf("--> glStencilMaskSeparate ()\n");
+	func_t *func = f_create("glStencilMaskSeparate");
+	f_append(func, sizeof(GLenum), &face);
+	f_append(func, sizeof(GLuint), &mask);
+	f_push(func);
 }
 
 void         glStencilOp (GLenum fail, GLenum zfail, GLenum zpass) {
 	printf("--> glStencilOp ()\n");
+	func_t *func = f_create("glStencilOp");
+	f_append(func, sizeof(GLenum), &fail);
+	f_append(func, sizeof(GLenum), &zfail);
+	f_append(func, sizeof(GLenum), &zpass);
+	f_push(func);
 }
 
 void         glStencilOpSeparate (GLenum face, GLenum fail, GLenum zfail, GLenum zpass) {
 	printf("--> glStencilOpSeparate ()\n");
+	func_t *func = f_create("glStencilOpSeparate");
+	f_append(func, sizeof(GLenum), &face);
+	f_append(func, sizeof(GLenum), &fail);
+	f_append(func, sizeof(GLenum), &zfail);
+	f_append(func, sizeof(GLenum), &zpass);
+	f_push(func);
 }
 
 void         glTexImage2D (GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid* pixels) {
 	printf("--> glTexImage2D ()\n");
+
+	int size = width * height;
+
+	assert(border == 0);
+	switch (format) {
+		case GL_ALPHA:
+		case GL_DEPTH_COMPONENT:
+		case GL_LUMINANCE:
+			break;
+		case GL_LUMINANCE_ALPHA: size *= 2; break;
+		case GL_RGB: size *= 3; break;
+		case GL_RGBA: size *= 4; break;
+		default: assert(0);
+	}
+
+	switch (type) {
+		case GL_BYTE:
+		case GL_UNSIGNED_BYTE:
+			break;
+		case GL_SHORT:
+		case GL_UNSIGNED_SHORT:
+			size *= 2;
+			break;
+		case GL_INT:
+		case GL_UNSIGNED_INT:
+		case GL_FLOAT:
+			size *= 4;
+			break;
+		default: assert(0);
+	}
+	
+	func_t *func = f_create("glTexImage2D");
+	f_append(func, sizeof(GLenum), &target);
+	f_append(func, sizeof(GLint), &level);
+	f_append(func, sizeof(GLint), &internalformat);
+	f_append(func, sizeof(GLsizei), &width);
+	f_append(func, sizeof(GLsizei), &height);
+	f_append(func, sizeof(GLint), &border);
+	f_append(func, sizeof(GLenum), &format);
+	f_append(func, sizeof(GLenum), &type);
+	if (pixels != NULL)
+		f_append(func, size, pixels);
+	else
+		f_append(func, 0, NULL);
+	f_push(func);
 }
 
 void         glTexParameterf (GLenum target, GLenum pname, GLfloat param) {
 	printf("--> glTexParameterf ()\n");
+	func_t *func = f_create("glTexParameterf");
+	f_append(func, sizeof(GLenum), &target);
+	f_append(func, sizeof(GLenum), &pname);
+	f_append(func, sizeof(GLfloat), &param);
+	f_push(func);
 }
 
 void         glTexParameterfv (GLenum target, GLenum pname, const GLfloat* params) {
 	printf("--> glTexParameterfv ()\n");
+	int count = 1;
+	// TODO
+	func_t *func = f_create("glTexParameterfv");
+	f_append(func, sizeof(GLenum), &target);
+	f_append(func, sizeof(GLenum), &pname);
+	f_append(func, sizeof(GLfloat) * count, params);
+	f_push(func);
 }
 
 void         glTexParameteri (GLenum target, GLenum pname, GLint param) {
 	printf("--> glTexParameteri ()\n");
+	func_t *func = f_create("glTexParameteri");
+	f_append(func, sizeof(GLenum), &target);
+	f_append(func, sizeof(GLenum), &pname);
+	f_append(func, sizeof(GLint), &param);
+	f_push(func);
 }
 
 void         glTexParameteriv (GLenum target, GLenum pname, const GLint* params) {
 	printf("--> glTexParameteriv ()\n");
+	int count = 1;
+	// TODO
+	func_t *func = f_create("glTexParameterfiv");
+	f_append(func, sizeof(GLenum), &target);
+	f_append(func, sizeof(GLenum), &pname);
+	f_append(func, sizeof(GLint) * count, params);
+	f_push(func);
 }
 
 void         glTexSubImage2D (GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid* pixels) {
 	printf("--> glTexSubImage2D ()\n");
+
+	int size = width * height;
+
+	switch (format) {
+		case GL_ALPHA:
+		case GL_DEPTH_COMPONENT:
+		case GL_LUMINANCE:
+			break;
+		case GL_LUMINANCE_ALPHA: size *= 2; break;
+		case GL_RGB: size *= 3; break;
+		case GL_RGBA: size *= 4; break;
+		default: assert(0);
+	}
+
+	switch (type) {
+		case GL_BYTE:
+		case GL_UNSIGNED_BYTE:
+			break;
+		case GL_SHORT:
+		case GL_UNSIGNED_SHORT:
+			size *= 2;
+			break;
+		case GL_INT:
+		case GL_UNSIGNED_INT:
+		case GL_FLOAT:
+			size *= 4;
+			break;
+		default: assert(0);
+	}
+	
+	func_t *func = f_create("glTexSubImage2D");
+	f_append(func, sizeof(GLenum), &target);
+	f_append(func, sizeof(GLint), &level);
+	f_append(func, sizeof(GLint), &xoffset);
+	f_append(func, sizeof(GLint), &yoffset);
+	f_append(func, sizeof(GLsizei), &width);
+	f_append(func, sizeof(GLsizei), &height);
+	f_append(func, sizeof(GLenum), &format);
+	f_append(func, sizeof(GLenum), &type);
+	if (pixels != NULL)
+		f_append(func, size, pixels);
+	else
+		f_append(func, 0, NULL);
+	f_push(func);
 }
 
 void         glUniform1f (GLint location, GLfloat x) {
 	printf("--> glUniform1f ()\n");
+	func_t *func = f_create("glUniform1f");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLfloat), &x);
+	f_push(func);
 }
 
 void         glUniform1fv (GLint location, GLsizei count, const GLfloat* v) {
 	printf("--> glUniform1fv ()\n");
+	func_t *func = f_create("glUniform1fv");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLsizei), &count);
+	f_append(func, sizeof(GLfloat) * count, v);
+	f_push(func);
 }
 
 void         glUniform1i (GLint location, GLint x) {
 	printf("--> glUniform1i ()\n");
+	func_t *func = f_create("glUniform1i");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLint), &x);
+	f_push(func);
 }
 
 void         glUniform1iv (GLint location, GLsizei count, const GLint* v) {
 	printf("--> glUniform1iv ()\n");
+	func_t *func = f_create("glUniform1iv");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLsizei), &count);
+	f_append(func, sizeof(GLint) * count, v);
+	f_push(func);
 }
 
 void         glUniform2f (GLint location, GLfloat x, GLfloat y) {
 	printf("--> glUniform2f ()\n");
+	func_t *func = f_create("glUniform2f");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLfloat), &x);
+	f_append(func, sizeof(GLfloat), &y);
+	f_push(func);
 }
 
 void         glUniform2fv (GLint location, GLsizei count, const GLfloat* v) {
 	printf("--> glUniform2fv ()\n");
+	func_t *func = f_create("glUniform2fv");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLsizei), &count);
+	f_append(func, sizeof(GLfloat) * count * 2, v);
+	f_push(func);
 }
 
 void         glUniform2i (GLint location, GLint x, GLint y) {
 	printf("--> glUniform2i ()\n");
+	func_t *func = f_create("glUniform2i");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLint), &x);
+	f_append(func, sizeof(GLint), &y);
+	f_push(func);
 }
 
 void         glUniform2iv (GLint location, GLsizei count, const GLint* v) {
 	printf("--> glUniform2iv ()\n");
+	func_t *func = f_create("glUniform2iv");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLsizei), &count);
+	f_append(func, sizeof(GLint) * count * 2, v);
+	f_push(func);
 }
 
 void         glUniform3f (GLint location, GLfloat x, GLfloat y, GLfloat z) {
 	printf("--> glUniform3f ()\n");
+	func_t *func = f_create("glUniform3f");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLfloat), &x);
+	f_append(func, sizeof(GLfloat), &y);
+	f_append(func, sizeof(GLfloat), &z);
+	f_push(func);
 }
 
 void         glUniform3fv (GLint location, GLsizei count, const GLfloat* v) {
 	printf("--> glUniform3fv ()\n");
+	func_t *func = f_create("glUniform3fv");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLsizei), &count);
+	f_append(func, sizeof(GLfloat) * count * 3, v);
+	f_push(func);
 }
 
 void         glUniform3i (GLint location, GLint x, GLint y, GLint z) {
 	printf("--> glUniform3i ()\n");
+	func_t *func = f_create("glUniform3i");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLint), &x);
+	f_append(func, sizeof(GLint), &y);
+	f_append(func, sizeof(GLint), &z);
+	f_push(func);
 }
 
 void         glUniform3iv (GLint location, GLsizei count, const GLint* v) {
 	printf("--> glUniform3iv ()\n");
+	func_t *func = f_create("glUniform3iv");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLsizei), &count);
+	f_append(func, sizeof(GLint) * count * 3, v);
+	f_push(func);
 }
 
 void         glUniform4f (GLint location, GLfloat x, GLfloat y, GLfloat z, GLfloat w) {
 	printf("--> glUniform4f ()\n");
+	func_t *func = f_create("glUniform4f");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLfloat), &x);
+	f_append(func, sizeof(GLfloat), &y);
+	f_append(func, sizeof(GLfloat), &z);
+	f_append(func, sizeof(GLfloat), &w);
+	f_push(func);
 }
 
 void         glUniform4fv (GLint location, GLsizei count, const GLfloat* v) {
 	printf("--> glUniform4fv ()\n");
+	func_t *func = f_create("glUniform4fv");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLsizei), &count);
+	f_append(func, sizeof(GLfloat) * count * 4, v);
+	f_push(func);
 }
 
 void         glUniform4i (GLint location, GLint x, GLint y, GLint z, GLint w) {
 	printf("--> glUniform4i ()\n");
+	func_t *func = f_create("glUniform4i");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLint), &x);
+	f_append(func, sizeof(GLint), &y);
+	f_append(func, sizeof(GLint), &z);
+	f_append(func, sizeof(GLint), &w);
+	f_push(func);
 }
 
 void         glUniform4iv (GLint location, GLsizei count, const GLint* v) {
 	printf("--> glUniform4iv ()\n");
+	func_t *func = f_create("glUniform4iv");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLsizei), &count);
+	f_append(func, sizeof(GLint) * count * 4, v);
+	f_push(func);
 }
 
 void         glUniformMatrix2fv (GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) {
 	printf("--> glUniformMatrix2fv ()\n");
+	func_t *func = f_create("glUniformMatrix2fv");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLboolean), &transpose);
+	f_append(func, sizeof(GLint) * count * 2 * 2, value);
+	f_push(func);
 }
 
 void         glUniformMatrix3fv (GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) {
 	printf("--> glUniformMatrix3fv ()\n");
+	func_t *func = f_create("glUniformMatrix3fv");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLboolean), &transpose);
+	f_append(func, sizeof(GLint) * count * 3 * 3, value);
+	f_push(func);
 }
 
 void         glUniformMatrix4fv (GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) {
 	printf("--> glUniformMatrix4fv ()\n");
+	func_t *func = f_create("glUniformMatrix4fv");
+	loc_t *loc = loc_search(_gl_current_program, location);
+	f_append(func, strlen(loc->name), loc->name);
+	f_append(func, sizeof(GLboolean), &transpose);
+	f_append(func, sizeof(GLint) * count * 4 * 4, value);
+	f_push(func);
 }
 
 void         glUseProgram (GLuint program) {
 	printf("--> glUseProgram ()\n");
+	_gl_current_program = program;
+	func_t *func = f_create("glUseProgram");
+	f_append(func, sizeof(GLuint), &program);
+	f_push(func);
 }
 
 void         glValidateProgram (GLuint program) {
 	printf("--> glValidateProgram ()\n");
+	func_t *func = f_create("glValidateProgram");
+	f_append(func, sizeof(GLuint), &program);
+	f_push(func);
 }
 
 void         glVertexAttrib1f (GLuint indx, GLfloat x) {
 	printf("--> glVertexAttrib1f ()\n");
+	func_t *func = f_create("glVertexAttrib1f");
+	f_append(func, sizeof(GLuint), &indx);
+	f_append(func, sizeof(GLfloat), &x);
+	f_push(func);
 }
 
 void         glVertexAttrib1fv (GLuint indx, const GLfloat* values) {
 	printf("--> glVertexAttrib1fv ()\n");
+	func_t *func = f_create("glVertexAttrib1fv");
+	f_append(func, sizeof(GLuint), &indx);
+	f_append(func, sizeof(GLfloat), values);
+	f_push(func);
 }
 
 void         glVertexAttrib2f (GLuint indx, GLfloat x, GLfloat y) {
 	printf("--> glVertexAttrib2f ()\n");
+	func_t *func = f_create("glVertexAttrib2f");
+	f_append(func, sizeof(GLuint), &indx);
+	f_append(func, sizeof(GLfloat), &x);
+	f_append(func, sizeof(GLfloat), &y);
+	f_push(func);
 }
 
 void         glVertexAttrib2fv (GLuint indx, const GLfloat* values) {
 	printf("--> glVertexAttrib2fv ()\n");
+	func_t *func = f_create("glVertexAttrib2fv");
+	f_append(func, sizeof(GLuint), &indx);
+	f_append(func, sizeof(GLfloat) * 2, values);
+	f_push(func);
 }
 
 void         glVertexAttrib3f (GLuint indx, GLfloat x, GLfloat y, GLfloat z) {
 	printf("--> glVertexAttrib3f ()\n");
+	func_t *func = f_create("glVertexAttrib3f");
+	f_append(func, sizeof(GLuint), &indx);
+	f_append(func, sizeof(GLfloat), &x);
+	f_append(func, sizeof(GLfloat), &y);
+	f_append(func, sizeof(GLfloat), &z);
+	f_push(func);
 }
 
 void         glVertexAttrib3fv (GLuint indx, const GLfloat* values) {
 	printf("--> glVertexAttrib3fv ()\n");
+	func_t *func = f_create("glVertexAttrib2fv");
+	f_append(func, sizeof(GLuint), &indx);
+	f_append(func, sizeof(GLfloat) * 3, values);
+	f_push(func);
 }
 
 void         glVertexAttrib4f (GLuint indx, GLfloat x, GLfloat y, GLfloat z, GLfloat w) {
 	printf("--> glVertexAttrib4f ()\n");
+	func_t *func = f_create("glVertexAttrib4f");
+	f_append(func, sizeof(GLuint), &indx);
+	f_append(func, sizeof(GLfloat), &x);
+	f_append(func, sizeof(GLfloat), &y);
+	f_append(func, sizeof(GLfloat), &z);
+	f_append(func, sizeof(GLfloat), &w);
+	f_push(func);
 }
 
 void         glVertexAttrib4fv (GLuint indx, const GLfloat* values) {
 	printf("--> glVertexAttrib4fv ()\n");
+	func_t *func = f_create("glVertexAttrib4fv");
+	f_append(func, sizeof(GLuint), &indx);
+	f_append(func, sizeof(GLfloat) * 4, values);
+	f_push(func);
 }
 
 void         glVertexAttribPointer (GLuint indx, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const GLvoid* ptr) {
 	printf("--> glVertexAttribPointer ()\n");
+	func_t *func = f_create("glVertexAttribPointer");
+	f_append(func, sizeof(GLuint), &indx);
+	f_append(func, sizeof(GLint), &size);
+	f_append(func, sizeof(GLenum), &type);
+	f_append(func, sizeof(GLboolean), &normalized);
+	f_append(func, sizeof(GLboolean), &stride);
+	f_append(func, sizeof(GLuint), &ptr);
+	f_push(func);
 }
 
 void         glViewport (GLint x, GLint y, GLsizei width, GLsizei height) {
 	printf("--> glViewport ()\n");
+	func_t *func = f_create("glViewport");
+	f_append(func, sizeof(GLint), &x);
+	f_append(func, sizeof(GLint), &y);
+	f_append(func, sizeof(GLsizei), &width);
+	f_append(func, sizeof(GLsizei), &height);
+	f_push(func);
 }
 
 #ifdef __APPLE__
@@ -1166,7 +1696,7 @@ callback_glproxy(
 			while (1) {
 				printf("==> pop a function\n");
 				func = f_pop();
-				printf("==> poped %x\n", func);
+				printf("==> poped %p\n", func);
 				if (func == NULL)
 					break;
 
@@ -1214,7 +1744,7 @@ callback_glproxy(
 
 				// serialize and send to socket
 				printf("==> sending %s with %d data\n", func->name, size);
-				hexdump(buf, size);
+				//hexdump(buf, size);
 				n = libwebsocket_write(wsi, (unsigned char *)buf, size, LWS_WRITE_BINARY);
 				printf("    <-- n was %d\n", n);
 
