@@ -1,0 +1,27 @@
+How to use
+==========
+
+(macosx only for now.)
+
+Fetch and checkout the "fake-window" branch on kivy
+
+Compile and install libwebsocket::
+
+	git clone git://git.warmcat.com/libwebsockets
+	cd libwebsockets
+	./configure --enable-nofork
+	make
+	cd ..
+
+Compile glproxy::
+
+	git clone ssh://github.com/tito/glproxy
+	cd glproxy
+	make
+	cd ..
+
+Then start it::
+
+	DYLD_LIBRARY_PATH=. KIVY_WINDOW=fake python ~/code/kivy/examples/demo/touchtracer/main.py 
+	
+And open a webbrowser to `html/index.html` 
