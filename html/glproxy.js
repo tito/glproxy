@@ -82,7 +82,7 @@ var gl_buffers = {}
 var gl_buffer_idx = 1;
 var gl_current_program;
 var socket_recv = function(msg){
-	var buf = new Uint8Array(msg.data).subarray(20);
+	var buf = new Uint8Array(msg.data).subarray(2);
 	var cmd = readCommand(buf);
 	buf = buf.subarray(cmd.length + 1);
 	data = buf;
@@ -130,12 +130,12 @@ var socket_recv = function(msg){
 			gl.texParameteri(uint(args[0]), uint(args[1]), uint(args[2]));
 			break;
 		case 'bindAttribLocation':
-			console.log('bindAttribLocation');
-			console.log(args);
-			console.log(uint(args[0]));
-			console.log(uint(args[1]));
-			console.log(cstr(args[2]));
-			console.log(gl_programs[uint(args[0])]);
+			//console.log('bindAttribLocation');
+			//console.log(args);
+			//console.log(uint(args[0]));
+			//console.log(uint(args[1]));
+			//console.log(cstr(args[2]));
+			//console.log(gl_programs[uint(args[0])]);
 			gl.bindAttribLocation(gl_programs[uint(args[0])], uint(args[1]), cstr(args[2]));
 			break;
 		case 'blendFunc':
@@ -186,7 +186,7 @@ var socket_recv = function(msg){
 			gl.attachShader(gl_programs[uint(args[0])], gl_shaders[uint(args[1])]);
 			break;
 		case 'bufferData':
-			console.log('load buffer of ' + uint(args[1]), '->', args[2].byteLength);
+			//console.log('load buffer of ' + uint(args[1]), '->', args[2].byteLength);
 			gl.bufferData(uint(args[0]), args[2], uint(args[3]));
 			break;
 		case 'bufferSubData':
@@ -196,7 +196,7 @@ var socket_recv = function(msg){
 			gl.bindAttribLocation(uint(args[0]), uint(args[1]), cstr(args[2]));
 			break;
 		case 'shaderSource':
-			console.log('load shader: ' + cstr2(args[2]));
+			//console.log('load shader: ' + cstr2(args[2]));
 			shader = gl_shaders[uint(args[0])];
 			shader.source = cstr2(args[2]);
 			gl.shaderSource(shader, shader.source);
@@ -269,12 +269,12 @@ var socket_recv = function(msg){
 			gl.uniform4fv(gl.getUniformLocation(gl_current_program, cstr(args[0])), cfloat32(args[1]));
 			break;
 		case 'uniformMatrix4fv':
-			console.log(args);
-			console.log(cstr(args[0]));
+			//console.log(args);
+			//console.log(cstr(args[0]));
 			loc = gl.getUniformLocation(gl_current_program, cstr(args[0]));
-			console.log(gl_current_program);
-			console.log(loc);
-			console.log(cfloat32(args[2]));
+			//console.log(gl_current_program);
+			//console.log(loc);
+			//console.log(cfloat32(args[2]));
 			gl.uniformMatrix4fv(gl.getUniformLocation(gl_current_program, cstr(args[0])), false, cfloat32(args[2]));
 			break;
 		case 'texImage2D':
@@ -298,16 +298,16 @@ var socket_recv = function(msg){
 			gl.viewport(a, b, c, d);
 			break;
 		case 'drawElements':
-			console.log('draw ' + uint(args[1]) + ' elements, mode=' + uint(args[0]) + ', type=' + uint(args[2]));
+			//console.log('draw ' + uint(args[1]) + ' elements, mode=' + uint(args[0]) + ', type=' + uint(args[2]));
 			indices = ushortv(args[3]);
-			console.log(indices);
-			console.log('before bindBuffer:');
+			//console.log(indices);
+			//console.log('before bindBuffer:');
 			var buffer = gl.createBuffer();
 			gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffer);
 			gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.DYNAMIC_DRAW);
-			console.log('after bindBuffer:' + gl.getError());
+			//console.log('after bindBuffer:' + gl.getError());
 			gl.drawElements(uint(args[0]), uint(args[1]), uint(args[2]), 0);
-			console.log('after drawElements:' + gl.getError());
+			//console.log('after drawElements:' + gl.getError());
 			break;
 		case 'vertexAttribPointer':
 			//console.log('attrib pointer size=' + uint(args[1]) + ' ptr=' + uint(args[5]));
@@ -328,16 +328,18 @@ var socket_recv = function(msg){
 	var err = gl.getError();
 	if (err)
 		console.error('cmd=' + cmd + ', error=' + err);
+	/**
 	else
 		console.log('cmd=' + cmd);
+	**/
 };
 
-/**
 var socket_send = function(obj){
-  var data = JSON.stringify(obj);
-  socket.send(data);
+	var x = obj.x;
+	var y = obj.y - (document.body.offsetHeight - 480);
+	var data = new Uint16Array([obj.type, x, y, obj.which]);
+	socket.send(data.buffer);
 };
-**/
 
 window.APP = {};
 $(document).ready(function() {
@@ -357,11 +359,10 @@ $(document).ready(function() {
     window.socket.onmessage = socket_recv;
     console.log("connected to websocket:", url);
 
-	/**
     $('html').live("mousemove", function(e) {
         //console.log("mouse_move", e);
         socket_send({
-          type: "mouse_move",
+          type: 0,
           x: e.pageX,
           y: e.pageY,
           which: e.which,
@@ -372,7 +373,7 @@ $(document).ready(function() {
     $('html').live("mousedown", function(e) {
         //console.log("mouse_down", e);
         socket_send({
-          type: "mouse_down",
+          type: 1,
           x: e.pageX,
           y: e.pageY,
           which: e.which,
@@ -383,7 +384,7 @@ $(document).ready(function() {
     $('html').live("mouseup", function(e) {
         //console.log("mouse_up", e);
         socket_send({
-          type: "mouse_up",
+          type: 2,
           x: e.pageX,
           y: e.pageY,
           which: e.which,
@@ -391,6 +392,7 @@ $(document).ready(function() {
         return false;
     });
 
+	/**
     $('html').live("keydown", function(e) {
         //console.log("key_down", e);
         socket_send({
