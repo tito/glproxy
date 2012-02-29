@@ -1,18 +1,7 @@
 var canvas_resize = function(){
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
-}
-
-var draw_canvas = function(nodes){
-  ctx = canvas.getContext('2d');
-  ctx.clearRect(0,0,canvas.width, canvas.height)
-  ctx.fillStyle = "rgb(200,0,0)";
-  console.log(nodes);
-  for (i in nodes){
-    console.log(i);
-    var n = nodes[i];
-      ctx.fillRect (n.x-10,n.y-10,20,20);
-  }
+	console.log('canvas size is:' + window.innerWidth);
 }
 
 function readCommand(buf) {
@@ -78,16 +67,270 @@ var gl_shaders = {}
 var gl_shader_idx = 1;
 var gl_programs = {}
 var gl_program_idx = 1;
+var gl_framebuffers = {}
+var gl_framebuffer_idx = 1;
+var gl_renderbuffers = {}
+var gl_renderbuffer_idx = 1;
 var gl_buffers = {}
 var gl_buffer_idx = 1;
 var gl_current_program;
+var gl_symbols = [
+"activeTexture",
+"attachShader",
+"bindAttribLocation",
+"bindBuffer",
+"bindFramebuffer",
+"bindRenderbuffer",
+"bindTexture",
+"blendColor",
+"blendEquation",
+"blendEquationSeparate",
+"blendFunc",
+"blendFuncSeparate",
+"bufferData",
+"bufferSubData",
+"checkFramebufferStatus",
+"clear",
+"clearColor",
+"clearDepthf",
+"clearStencil",
+"colorMask",
+"compileShader",
+"compressedTexImage2D",
+"compressedTexSubImage2D",
+"copyTexImage2D",
+"copyTexSubImage2D",
+"createProgram",
+"createShader",
+"cullFace",
+"deleteBuffers",
+"deleteFramebuffers",
+"deleteProgram",
+"deleteRenderbuffers",
+"deleteShader",
+"deleteTextures",
+"depthFunc",
+"depthMask",
+"depthRangef",
+"detachShader",
+"disable",
+"disableVertexAttribArray",
+"drawArrays",
+"drawElements",
+"enable",
+"enableVertexAttribArray",
+"finish",
+"flush",
+"framebufferRenderbuffer",
+"framebufferTexture2D",
+"frontFace",
+"genBuffers",
+"generateMipmap",
+"genFramebuffers",
+"genRenderbuffers",
+"genTextures",
+"getActiveAttrib",
+"getActiveUniform",
+"getAttachedShaders",
+"getAttribLocation",
+"getBooleanv",
+"getBufferParameteriv",
+"getError",
+"getFloatv",
+"getFramebufferAttachmentParameteriv",
+"getIntegerv",
+"getProgramiv",
+"getProgramInfoLog",
+"getRenderbufferParameteriv",
+"getShaderiv",
+"getShaderInfoLog",
+"getShaderPrecisionFormat",
+"getShaderSource",
+"getString",
+"getTexParameterfv",
+"getTexParameteriv",
+"getUniformfv",
+"getUniformiv",
+"getUniformLocation",
+"getVertexAttribfv",
+"getVertexAttribiv",
+"getVertexAttribPointerv",
+"hint",
+"isBuffer",
+"isEnabled",
+"isFramebuffer",
+"isProgram",
+"isRenderbuffer",
+"isShader",
+"isTexture",
+"lineWidth",
+"linkProgram",
+"pixelStorei",
+"polygonOffset",
+"readPixels",
+"releaseShaderCompiler",
+"renderbufferStorage",
+"sampleCoverage",
+"scissor",
+"shaderBinary",
+"shaderSource",
+"stencilFunc",
+"stencilFuncSeparate",
+"stencilMask",
+"stencilMaskSeparate",
+"stencilOp",
+"stencilOpSeparate",
+"texImage2D",
+"texParameterf",
+"texParameterfv",
+"texParameteri",
+"texParameteriv",
+"texSubImage2D",
+"uniform1f",
+"uniform1fv",
+"uniform1i",
+"uniform1iv",
+"uniform2f",
+"uniform2fv",
+"uniform2i",
+"uniform2iv",
+"uniform3f",
+"uniform3fv",
+"uniform3i",
+"uniform3iv",
+"uniform4f",
+"uniform4fv",
+"uniform4i",
+"uniform4iv",
+"uniformMatrix2fv",
+"uniformMatrix3fv",
+"uniformMatrix4fv",
+"useProgram",
+"validateProgram",
+"vertexAttrib1f",
+"vertexAttrib1fv",
+"vertexAttrib2f",
+"vertexAttrib2fv",
+"vertexAttrib3f",
+"vertexAttrib3fv",
+"vertexAttrib4f",
+"vertexAttrib4fv",
+"vertexAttribPointer",
+"viewport"
+];
+
+var M_CLR = 256; /* clear table marker */
+var M_EOD = 257; /* end-of-data marker */
+var M_NEW = 258; /* new code index */
+var frame = 0;
+// Decompress an LZW-encoded string
+function lzw_decode(bin)
+{
+	var out = [];
+
+	function new_dec_t() {
+		// prev, back, c
+		var dt = [];
+		for ( var i = 0; i < 512; i++ )
+			dt.push([0, 0, 0]);
+		return dt;
+	}
+ 
+	var d = new_dec_t();
+	var len, j, next_shift = 512, bits = 9, n_bits = 0;
+	var code, c, t, next_code = M_NEW;
+ 
+	var tmp = 0;
+	function get_code() {
+		while(n_bits < bits) {
+			if (len > 0) {
+				len --;
+				tmp = (tmp << 8) | bin[0];
+				bin = bin.subarray(1);
+				n_bits += 8;
+			} else {
+				tmp = tmp << (bits - n_bits);
+				n_bits = bits;
+			}
+		}
+		n_bits -= bits;
+		code = tmp >> n_bits;
+		tmp &= (1 << n_bits) - 1;
+	}
+ 
+	function clear_table() {
+		d = new_dec_t();
+		for (j = 0; j < 256; j++) d[j][2] = j;
+		next_code = M_NEW;
+		next_shift = 512;
+		bits = 9;
+	};
+
+	function _setsize(d, ndl) {
+		for (j = d.length; j < ndl; j++)
+			d.push([0, 0, 0]);
+	}
+ 
+	clear_table(); /* in case encoded bits didn't start with M_CLR */
+	for (len = bin.byteLength; len;) {
+		get_code();
+		if (code == M_EOD) break;
+		if (code == M_CLR) {
+			clear_table();
+			continue;
+		}
+ 
+		if (code >= next_code) {
+			console.error("Bad sequence");
+			return;
+		}
+ 
+		d[next_code][0] = c = code;
+		while (c > 255) {
+			t = d[c][0]; d[t][1] = c; c = t;
+		}
+ 
+		d[next_code - 1][2] = c;
+ 
+		while (d[c][1]) {
+			out.push(d[c][2]);
+			t = d[c][1]; d[c][1] = 0; c = t;
+		}
+		out.push(d[c][2]);
+		if (++next_code >= next_shift) {
+			if (++bits > 16) {
+				/* if input was correct, we'd have hit M_CLR before this */
+				console.error("Too many bits");
+				return;
+			}
+			next_shift *= 2;
+			_setsize(d, next_shift);
+		}
+	}
+ 
+	/* might be ok, so just whine, don't be drastic */
+	if (code != M_EOD)
+		console.warn("Bits did not end in EOD");
+ 
+	return new Uint8Array(out);
+}
+
+var z = [];
 var socket_recv = function(msg){
-	var buf = new Uint8Array(msg.data).subarray(2);
-	var cmd = readCommand(buf);
-	buf = buf.subarray(cmd.length + 1);
+	var buf = new Uint8Array(msg.data);
+	buf = lzw_decode(buf);
+	//console.log(buf);
+	//console.log(cstr(buf));
+	//return;
+
+	var cmd = gl_symbols[uint(buf.subarray(0, 4))];
+	buf = buf.subarray(4);
 	data = buf;
 	var iarg = uint(buf);
 	buf = buf.subarray(4);
+
+	//console.log(cmd);
+	//return;
 
 	var args = new Array();
 	for ( i = 0; i < iarg; i++ ) {
@@ -96,6 +339,38 @@ var socket_recv = function(msg){
 		args.push(buf.subarray(0, size));
 		buf = buf.subarray(size);
 	}
+
+	if ( cmd == 'enable' && uint(args[0]) == 0x9999 )
+		display();
+	else {
+		z.push([cmd, args]);
+		if ( frame == 0 )
+			showlog("Waiting a complete frame (" + z.length + ")");
+	}
+}
+
+function display() {
+	frame++;
+	hidelog();
+	//console.debug('>> show frame with ' + z.length + ' commands');
+	for ( var i = 0; i < z.length; i++ ) {
+		var cmd = z[i][0];
+		var args = z[i][1];
+		runcmd(cmd, args);
+	}
+	z = [];
+}
+
+function showlog(msg) {
+	$('#log').show();
+	$('#logmsg').html(msg);
+}
+
+function hidelog(msg) {
+	$('#log').fadeOut();
+}
+
+function runcmd(cmd, args) {
 
 	//console.log(cmd);
 	//console.log(args);
@@ -107,9 +382,6 @@ var socket_recv = function(msg){
 			break;
 		case 'clearColor':
 			gl.clearColor(cfloat32(args[0]), cfloat32(args[1]), cfloat32(args[2]), cfloat32(args[3]));
-			break;
-		case 'finish':
-			gl.finish();
 			break;
 		case 'finish':
 			gl.finish();
@@ -156,6 +428,14 @@ var socket_recv = function(msg){
 			gl_programs[gl_program_idx] = gl.createProgram();
 			gl_program_idx++;
 			break;
+		case 'genRenderbuffers':
+			gl_renderbuffers[gl_renderbuffer_idx] = gl.createFramebuffer();
+			gl_renderbuffer_idx++;
+			break;
+		case 'genFramebuffers':
+			gl_framebuffers[gl_framebuffer_idx] = gl.createFramebuffer();
+			gl_framebuffer_idx++;
+			break;
 		case 'genBuffers':
 			gl_buffers[gl_buffer_idx] = gl.createBuffer();
 			gl_buffer_idx++;
@@ -165,8 +445,19 @@ var socket_recv = function(msg){
 			gl.bindBuffer(uint(args[0]), gl_buffers[idx]);
 			break;
 		case 'bindTexture':
-			//console.log("gl.bindTexture(" + uint(args[0]) + ", " + gl_textures[uint(args[1])] + "(" + uint(args[1]) + "))");
 			gl.bindTexture(uint(args[0]), gl_textures[uint(args[1])]);
+			break;
+		case 'bindFramebuffer':
+			gl.bindFramebuffer(uint(args[0]), gl_framebuffers[uint(args[1])]);
+			break;
+		case 'bindRenderbuffer':
+			gl.bindRenderbuffer(uint(args[0]), gl_renderbuffers[uint(args[1])]);
+			break;
+		case 'framebufferTexture2D':
+			gl.framebufferTexture2D(uint(args[0]), uint(args[1]), uint(args[2]), gl_textures[uint(args[3])], uint(args[4]));
+			break;
+		case 'framebufferRenderbuffer':
+			gl.framebufferRenderbuffer(uint(args[0]), uint(args[1]), uint(args[3]), gl_renderbuffers[uint(args[4])]);
 			break;
 		case 'useProgram':
 			idx = uint(args[0]);
@@ -190,7 +481,7 @@ var socket_recv = function(msg){
 			gl.bufferData(uint(args[0]), args[2], uint(args[3]));
 			break;
 		case 'bufferSubData':
-			gl.bufferData(uint(args[0]), uint(args[1]), args[3]);
+			gl.bufferSubData(uint(args[0]), uint(args[1]), args[3]);
 			break;
 		case 'bindAttribLocation':
 			gl.bindAttribLocation(uint(args[0]), uint(args[1]), cstr(args[2]));
@@ -278,13 +569,13 @@ var socket_recv = function(msg){
 			gl.uniformMatrix4fv(gl.getUniformLocation(gl_current_program, cstr(args[0])), false, cfloat32(args[2]));
 			break;
 		case 'texImage2D':
-			console.log('load image ' + uint(args[3]) + 'x' + uint(args[4]))
+			//console.log('load image ' + uint(args[3]) + 'x' + uint(args[4]))
 			gl.texImage2D(uint(args[0]), uint(args[1]), uint(args[2]),
 				uint(args[3]), uint(args[4]), uint(args[5]), uint(args[6]),
 				uint(args[7]), args[8]);
 			break;
 		case 'texSubImage2D':
-			console.log('load subimage ' + uint(args[4]) + 'x' + uint(args[5]))
+			//console.log('load subimage ' + uint(args[4]) + 'x' + uint(args[5]))
 			gl.texSubImage2D(uint(args[0]), uint(args[1]), uint(args[2]),
 				uint(args[3]), uint(args[4]), uint(args[5]), uint(args[6]),
 				uint(args[7]), args[8]);
@@ -318,6 +609,28 @@ var socket_recv = function(msg){
 		case 'enableVertexAttribArray':
 			gl.enableVertexAttribArray(uint(args[0]));
 			break;
+		case 'colorMask':
+			gl.colorMask(uint(args[0]), uint(args[1]), uint(args[2]), uint(args[3]));
+			break;
+		case 'stencilOp':
+			gl.stencilOp(uint(args[0]), uint(args[1]), uint(args[2]));
+			break;
+		case 'stencilFunc':
+			gl.stencilFunc(uint(args[0]), uint(args[1]), uint(args[2]));
+			break;
+		case 'stencilMask':
+			gl.stencilMask(uint(args[0]));
+			break;
+		case 'clearStencil':
+			gl.clearStencil(uint(args[0]));
+			break;
+		case 'deleteTextures':
+			gl.deleteTexture(gl_textures[uint(args[0])]);
+			break;
+		case 'deleteBuffers':
+			gl.deleteBuffer(gl_buffers[uint(args[0])]);
+			break;
+			
 		default:
 			// DOESNT WORK >_>
 			//eval('gl.' + cmd).apply(gl, args);
@@ -335,11 +648,64 @@ var socket_recv = function(msg){
 };
 
 var socket_send = function(obj){
-	var x = obj.x;
-	var y = obj.y - (document.body.offsetHeight - 480);
-	var data = new Uint16Array([obj.type, x, y, obj.which]);
+	var data = new Uint16Array([obj.type, obj.x, obj.y, obj.which]);
 	socket.send(data.buffer);
 };
+
+var socket_open = function(obj) {
+	// at the connect, send the viewport size
+	var data = new Uint16Array([99, gl.viewportWidth, gl.viewportHeight, 0]);
+	socket.send(data.buffer);
+	showlog("Waiting a complete frame");
+	retry = 0;
+	frame = 0;
+}
+
+function reset_gl() {
+	// XXX FREE !!!!
+	gl_textures = {}
+	gl_texture_idx = 1;
+	gl_shaders = {}
+	gl_shader_idx = 1;
+	gl_programs = {}
+	gl_program_idx = 1;
+	gl_framebuffers = {}
+	gl_framebuffer_idx = 1;
+	gl_renderbuffers = {}
+	gl_renderbuffer_idx = 1;
+	gl_buffers = {}
+	gl_buffer_idx = 1;
+	gl_current_program = 0;
+	z = [];
+}
+
+var socket_close = function(obj) {
+	console.log('Server disconnected');
+	setTimeout("tryconnect()", 2000);
+}
+
+var socket_error = function(obj) {
+	console.error('Server error:' + obj);
+	setTimeout("tryconnect()", 2000);
+}
+
+var retry = 0;
+function tryconnect() {
+	reset_gl();
+	var url = location.hash.substring(1);
+	if ( url == "" )
+		url = "localhost:8888";
+    url = "ws://" + url + "/";
+	showlog("Connecting to " + url + " <i>(" + retry + ")</i>");
+	retry++;
+    window.socket = new WebSocket(url, "glproxy");
+    window.socket.binaryType = "arraybuffer";
+    window.socket.onmessage = socket_recv;
+	window.socket.onopen = socket_open;
+	window.socket.onclose = socket_close;
+	window.socket.onerror = socket_error;
+    console.log("connecting to websocket...", url);
+}
 
 window.APP = {};
 $(document).ready(function() {
@@ -348,16 +714,12 @@ $(document).ready(function() {
     window.canvas = document.getElementById('canvas');
     window.addEventListener("resize", canvas_resize)
 	window.gl = window.canvas.getContext("experimental-webgl");
+    canvas_resize();
 	window.gl.viewportWidth = window.canvas.width;
 	window.gl.viewportHeight = window.canvas.height;
-    canvas_resize();
     console.log("canvas initialized...")
+	tryconnect();
 
-    var url = "ws://localhost:8888/";
-    window.socket = new WebSocket(url, "glproxy");
-    window.socket.binaryType = "arraybuffer";
-    window.socket.onmessage = socket_recv;
-    console.log("connected to websocket:", url);
 
     $('html').live("mousemove", function(e) {
         //console.log("mouse_move", e);

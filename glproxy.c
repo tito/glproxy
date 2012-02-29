@@ -6,12 +6,19 @@
 #include <unistd.h>
 #include <assert.h>
 #include <lo/lo.h>
+#include <signal.h>
 
+//#define FLOG(x) printf(x);
 #define FLOG(x)
 
 static lo_address tuio_address;
 static int server_port = 8888;
 static pthread_mutex_t qfuncmtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t viewport_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int viewport_width = -1;
+static int viewport_height = -1;
+struct libwebsocket_context *context = NULL;
+static int do_exit = 0;
 
 enum demo_protocols {
 	PROTOCOL_GLPROXY,
@@ -169,9 +176,136 @@ static void loc_flush(int program) {
 }
 
 //-----------------------------------------------------------------------------
+// LZW COMPRESSION
+//-----------------------------------------------------------------------------
+//
+/* -------- aux stuff ---------- */
+void* mem_alloc(size_t item_size, size_t n_item)
+{
+	size_t *x = calloc(1, sizeof(size_t)*2 + n_item * item_size);
+	x[0] = item_size;
+	x[1] = n_item;
+	return x + 2;
+}
+ 
+void* mem_extend(void *m, size_t new_n)
+{
+	size_t *x = (size_t*)m - 2;
+	x = realloc(x, sizeof(size_t) * 2 + *x * new_n);
+	if (new_n > x[1])
+		memset((char*)(x + 2) + x[0] * x[1], 0, x[0] * (new_n - x[1]));
+	x[1] = new_n;
+	return x + 2;
+}
+ 
+inline void _clear(void *m)
+{
+	size_t *x = (size_t*)m - 2;
+	memset(m, 0, x[0] * x[1]);
+}
+ 
+#define _new(type, n)	mem_alloc(sizeof(type), n)
+#define _del(m)		{ free((size_t*)(m) - 2); m = 0; }
+#define _len(m)		*((size_t*)m - 1)
+#define _setsize(m, n)	m = mem_extend(m, n)
+#define _extend(m)	m = mem_extend(m, _len(m) * 2)
+ 
+ 
+/* ----------- LZW stuff -------------- */
+typedef uint8_t byte;
+typedef uint16_t ushort;
+ 
+#define M_CLR	256	/* clear table marker */
+#define M_EOD	257	/* end-of-data marker */
+#define M_NEW	258	/* new code index */
+ 
+/* encode and decode dictionary structures.
+   for encoding, entry at code index is a list of indices that follow current one,
+   i.e. if code 97 is 'a', code 387 is 'ab', and code 1022 is 'abc',
+   then dict[97].next['b'] = 387, dict[387].next['c'] = 1022, etc. */
+typedef struct {
+	ushort next[256];
+} lzw_enc_t;
+ 
+/* for decoding, dictionary contains index of whatever prefix index plus trailing
+   byte.  i.e. like previous example,
+   	dict[1022] = { c: 'c', prev: 387 },
+   	dict[387]  = { c: 'b', prev: 97 },
+   	dict[97]   = { c: 'a', prev: 0 }
+   the "back" element is used for temporarily chaining indices when resolving
+   a code to bytes
+ */
+typedef struct {
+	ushort prev, back;
+	byte c;
+} lzw_dec_t;
+ 
+byte* lzw_encode(byte *in, int max_bits)
+{
+	int len = _len(in), bits = 9, next_shift = 512;
+	ushort code, c, nc, next_code = M_NEW;
+	lzw_enc_t *d = _new(lzw_enc_t, 512);
+ 
+	if (max_bits > 16) max_bits = 16;
+	if (max_bits < 9 ) max_bits = 12;
+ 
+	byte *out = _new(ushort, 4);
+	int out_len = 0, o_bits = 0;
+	uint32_t tmp = 0;
+ 
+	inline void write_bits(ushort x) {
+		tmp = (tmp << bits) | x;
+		o_bits += bits;
+		if (_len(out) <= out_len) _extend(out);
+		while (o_bits >= 8) {
+			o_bits -= 8;
+			out[out_len++] = tmp >> o_bits;
+			tmp &= (1 << o_bits) - 1;
+		}
+	}
+ 
+	//write_bits(M_CLR);
+	for (code = *(in++); --len; ) {
+		c = *(in++);
+		if ((nc = d[code].next[c]))
+			code = nc;
+		else {
+			write_bits(code);
+			nc = d[code].next[c] = next_code++;
+			code = c;
+		}
+ 
+		/* next new code would be too long for current table */
+		if (next_code == next_shift) {
+			/* either reset table back to 9 bits */
+			if (++bits > max_bits) {
+				/* table clear marker must occur before bit reset */
+				write_bits(M_CLR);
+ 
+				bits = 9;
+				next_shift = 512;
+				next_code = M_NEW;
+				_clear(d);
+			} else	/* or extend table */
+				_setsize(d, next_shift *= 2);
+		}
+	}
+ 
+	write_bits(code);
+	write_bits(M_EOD);
+	if (tmp) write_bits(tmp);
+ 
+	_del(d);
+ 
+	_setsize(out, out_len);
+	return out;
+}
+
+//-----------------------------------------------------------------------------
 // OPENGL REDIRECTION
 //-----------------------------------------------------------------------------
 
+#define GL_VIEWPORT                       0x0BA2
 #define GL_MAX_TEXTURE_SIZE               0x0D33
 #define GL_MAX_TEXTURE_IMAGE_UNITS        0x8872
 #define GL_COMPILE_STATUS                 0x8B81
@@ -223,6 +357,28 @@ static unsigned int _gl_framebuffers = 1;
 static unsigned int _gl_renderbuffers = 1;
 static unsigned int _gl_textures = 1;
 static unsigned int _gl_current_program = 0;
+
+static char *gl_symbols[] = {
+"glActiveTexture", "glAttachShader", "glBindAttribLocation", "glBindBuffer", "glBindFramebuffer", "glBindRenderbuffer", "glBindTexture",
+"glBlendColor", "glBlendEquation", "glBlendEquationSeparate", "glBlendFunc", "glBlendFuncSeparate", "glBufferData", "glBufferSubData",
+"glCheckFramebufferStatus", "glClear", "glClearColor", "glClearDepthf", "glClearStencil", "glColorMask", "glCompileShader", "glCompressedTexImage2D",
+"glCompressedTexSubImage2D", "glCopyTexImage2D", "glCopyTexSubImage2D", "glCreateProgram", "glCreateShader", "glCullFace",
+"glDeleteBuffers", "glDeleteFramebuffers", "glDeleteProgram", "glDeleteRenderbuffers", "glDeleteShader", "glDeleteTextures",
+"glDepthFunc", "glDepthMask", "glDepthRangef", "glDetachShader", "glDisable", "glDisableVertexAttribArray", "glDrawArrays",
+"glDrawElements", "glEnable", "glEnableVertexAttribArray", "glFinish", "glFlush", "glFramebufferRenderbuffer", "glFramebufferTexture2D",
+"glFrontFace", "glGenBuffers", "glGenerateMipmap", "glGenFramebuffers", "glGenRenderbuffers", "glGenTextures", "glGetActiveAttrib",
+"glGetActiveUniform", "glGetAttachedShaders", "glGetAttribLocation", "glGetBooleanv", "glGetBufferParameteriv", "glGetError", "glGetFloatv",
+"glGetFramebufferAttachmentParameteriv", "glGetIntegerv", "glGetProgramiv", "glGetProgramInfoLog", "glGetRenderbufferParameteriv",
+"glGetShaderiv", "glGetShaderInfoLog", "glGetShaderPrecisionFormat", "glGetShaderSource", "glGetString", "glGetTexParameterfv",
+"glGetTexParameteriv", "glGetUniformfv", "glGetUniformiv", "glGetUniformLocation", "glGetVertexAttribfv", "glGetVertexAttribiv",
+"glGetVertexAttribPointerv", "glHint", "glIsBuffer", "glIsEnabled", "glIsFramebuffer", "glIsProgram", "glIsRenderbuffer", "glIsShader",
+"glIsTexture", "glLineWidth", "glLinkProgram", "glPixelStorei", "glPolygonOffset", "glReadPixels", "glReleaseShaderCompiler", "glRenderbufferStorage",
+"glSampleCoverage", "glScissor", "glShaderBinary", "glShaderSource", "glStencilFunc", "glStencilFuncSeparate", "glStencilMask",
+"glStencilMaskSeparate", "glStencilOp", "glStencilOpSeparate", "glTexImage2D", "glTexParameterf", "glTexParameterfv", "glTexParameteri",
+"glTexParameteriv", "glTexSubImage2D", "glUniform1f", "glUniform1fv", "glUniform1i", "glUniform1iv", "glUniform2f", "glUniform2fv", "glUniform2i",
+"glUniform2iv", "glUniform3f", "glUniform3fv", "glUniform3i", "glUniform3iv", "glUniform4f", "glUniform4fv", "glUniform4i", "glUniform4iv", "glUniformMatrix2fv",
+"glUniformMatrix3fv", "glUniformMatrix4fv", "glUseProgram", "glValidateProgram", "glVertexAttrib1f", "glVertexAttrib1fv", "glVertexAttrib2f", "glVertexAttrib2fv",
+"glVertexAttrib3f", "glVertexAttrib3fv", "glVertexAttrib4f", "glVertexAttrib4fv", "glVertexAttribPointer", "glViewport"};
 
 void         glActiveTexture (GLenum texture) {
 	FLOG("--> glActiveTexture ()\n");
@@ -590,12 +746,23 @@ void         glFlush (void) {
 
 void         glFramebufferRenderbuffer (GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {
 	FLOG("--> glFramebufferRenderbuffer ()\n");
-	assert(0);
+	func_t *func = f_create("glFramebufferRenderbuffer");
+	f_append(func, sizeof(GLenum), &target);
+	f_append(func, sizeof(GLenum), &attachment);
+	f_append(func, sizeof(GLenum), &renderbuffertarget);
+	f_append(func, sizeof(GLuint), &renderbuffer);
+	f_push(func);
 }
 
 void         glFramebufferTexture2D (GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
 	FLOG("--> glFramebufferTexture2D ()\n");
-	assert(0);
+	func_t *func = f_create("glFramebufferTexture2D");
+	f_append(func, sizeof(GLenum), &target);
+	f_append(func, sizeof(GLenum), &attachment);
+	f_append(func, sizeof(GLenum), &textarget);
+	f_append(func, sizeof(GLuint), &texture);
+	f_append(func, sizeof(GLint), &level);
+	f_push(func);
 }
 
 void         glFrontFace (GLenum mode) {
@@ -630,7 +797,7 @@ void         glGenFramebuffers (GLsizei n, GLuint* framebuffers) {
 	func_t *func;
 	for (i = 0; i < n; i++) {
 		framebuffers[i] = _gl_framebuffers + i;
-		func = f_create("glGenBuffers");
+		func = f_create("glGenFramebuffers");
 		f_push(func);
 	}
 	_gl_framebuffers += n;
@@ -704,6 +871,20 @@ void         glGetIntegerv (GLenum pname, GLint* params) {
 		*params = 4096;
 	else if ( pname == GL_MAX_TEXTURE_IMAGE_UNITS )
 		*params = 8;
+	else if ( pname == GL_VIEWPORT ) {
+		// wait until a client is connected
+		printf("GOT VIEWPORT ASK? WAIT FOR RESPONSE??\n");
+		pthread_mutex_lock(&viewport_mutex);
+		if ( viewport_width == -1 ) {
+			pthread_mutex_lock(&viewport_mutex);
+		}
+		params[0] = 0;
+		params[1] = 0;
+		params[2] = viewport_width;
+		params[3] = viewport_height;
+		printf("GOT VIEWPORT, give %dx%d\n", viewport_width, viewport_height);
+		pthread_mutex_unlock(&viewport_mutex);
+	}
 }
 
 void         glGetProgramiv (GLuint program, GLenum pname, GLint* params) {
@@ -1122,17 +1303,16 @@ void         glUniform1f (GLint location, GLfloat x) {
 	FLOG("--> glUniform1f ()\n");
 	func_t *func = f_create("glUniform1f");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if ( loc == NULL ) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLfloat), &x);
-	f_push(func);
-}
+	f_push(func); }
 
 void         glUniform1fv (GLint location, GLsizei count, const GLfloat* v) {
 	FLOG("--> glUniform1fv ()\n");
 	func_t *func = f_create("glUniform1fv");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if ( loc == NULL ) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLsizei), &count);
 	f_append(func, sizeof(GLfloat) * count, (void *)v);
@@ -1143,7 +1323,7 @@ void         glUniform1i (GLint location, GLint x) {
 	FLOG("--> glUniform1i ()\n");
 	func_t *func = f_create("glUniform1i");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if ( loc == NULL ) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLint), &x);
 	f_push(func);
@@ -1153,7 +1333,7 @@ void         glUniform1iv (GLint location, GLsizei count, const GLint* v) {
 	FLOG("--> glUniform1iv ()\n");
 	func_t *func = f_create("glUniform1iv");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if ( loc == NULL ) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLsizei), &count);
 	f_append(func, sizeof(GLint) * count, (void *)v);
@@ -1164,7 +1344,7 @@ void         glUniform2f (GLint location, GLfloat x, GLfloat y) {
 	FLOG("--> glUniform2f ()\n");
 	func_t *func = f_create("glUniform2f");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if (loc == NULL) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLfloat), &x);
 	f_append(func, sizeof(GLfloat), &y);
@@ -1175,7 +1355,7 @@ void         glUniform2fv (GLint location, GLsizei count, const GLfloat* v) {
 	FLOG("--> glUniform2fv ()\n");
 	func_t *func = f_create("glUniform2fv");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if (loc == NULL) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLsizei), &count);
 	f_append(func, sizeof(GLfloat) * count * 2, (void *)v);
@@ -1186,7 +1366,7 @@ void         glUniform2i (GLint location, GLint x, GLint y) {
 	FLOG("--> glUniform2i ()\n");
 	func_t *func = f_create("glUniform2i");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if (loc == NULL) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLint), &x);
 	f_append(func, sizeof(GLint), &y);
@@ -1197,7 +1377,7 @@ void         glUniform2iv (GLint location, GLsizei count, const GLint* v) {
 	FLOG("--> glUniform2iv ()\n");
 	func_t *func = f_create("glUniform2iv");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if (loc == NULL) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLsizei), &count);
 	f_append(func, sizeof(GLint) * count * 2, (void *)v);
@@ -1208,7 +1388,7 @@ void         glUniform3f (GLint location, GLfloat x, GLfloat y, GLfloat z) {
 	FLOG("--> glUniform3f ()\n");
 	func_t *func = f_create("glUniform3f");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if (loc == NULL) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLfloat), &x);
 	f_append(func, sizeof(GLfloat), &y);
@@ -1220,7 +1400,7 @@ void         glUniform3fv (GLint location, GLsizei count, const GLfloat* v) {
 	FLOG("--> glUniform3fv ()\n");
 	func_t *func = f_create("glUniform3fv");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if (loc == NULL) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLsizei), &count);
 	f_append(func, sizeof(GLfloat) * count * 3, (void *)v);
@@ -1231,7 +1411,7 @@ void         glUniform3i (GLint location, GLint x, GLint y, GLint z) {
 	FLOG("--> glUniform3i ()\n");
 	func_t *func = f_create("glUniform3i");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if (loc == NULL) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLint), &x);
 	f_append(func, sizeof(GLint), &y);
@@ -1243,7 +1423,7 @@ void         glUniform3iv (GLint location, GLsizei count, const GLint* v) {
 	FLOG("--> glUniform3iv ()\n");
 	func_t *func = f_create("glUniform3iv");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if (loc == NULL) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLsizei), &count);
 	f_append(func, sizeof(GLint) * count * 3, (void *)v);
@@ -1254,7 +1434,7 @@ void         glUniform4f (GLint location, GLfloat x, GLfloat y, GLfloat z, GLflo
 	FLOG("--> glUniform4f ()\n");
 	func_t *func = f_create("glUniform4f");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if (loc == NULL) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLfloat), &x);
 	f_append(func, sizeof(GLfloat), &y);
@@ -1267,7 +1447,7 @@ void         glUniform4fv (GLint location, GLsizei count, const GLfloat* v) {
 	FLOG("--> glUniform4fv ()\n");
 	func_t *func = f_create("glUniform4fv");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if (loc == NULL) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLsizei), &count);
 	f_append(func, sizeof(GLfloat) * count * 4, (void *)v);
@@ -1278,7 +1458,7 @@ void         glUniform4i (GLint location, GLint x, GLint y, GLint z, GLint w) {
 	FLOG("--> glUniform4i ()\n");
 	func_t *func = f_create("glUniform4i");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if (loc == NULL) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLint), &x);
 	f_append(func, sizeof(GLint), &y);
@@ -1291,7 +1471,7 @@ void         glUniform4iv (GLint location, GLsizei count, const GLint* v) {
 	FLOG("--> glUniform4iv ()\n");
 	func_t *func = f_create("glUniform4iv");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if (loc == NULL) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLsizei), &count);
 	f_append(func, sizeof(GLint) * count * 4, (void *)v);
@@ -1302,7 +1482,7 @@ void         glUniformMatrix2fv (GLint location, GLsizei count, GLboolean transp
 	FLOG("--> glUniformMatrix2fv ()\n");
 	func_t *func = f_create("glUniformMatrix2fv");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if (loc == NULL) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLboolean), &transpose);
 	f_append(func, sizeof(GLint) * count * 2 * 2, (void *)value);
@@ -1313,7 +1493,7 @@ void         glUniformMatrix3fv (GLint location, GLsizei count, GLboolean transp
 	FLOG("--> glUniformMatrix3fv ()\n");
 	func_t *func = f_create("glUniformMatrix3fv");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if (loc == NULL) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLboolean), &transpose);
 	f_append(func, sizeof(GLint) * count * 3 * 3, (void *)value);
@@ -1324,7 +1504,7 @@ void         glUniformMatrix4fv (GLint location, GLsizei count, GLboolean transp
 	FLOG("--> glUniformMatrix4fv ()\n");
 	func_t *func = f_create("glUniformMatrix4fv");
 	loc_t *loc = loc_search(_gl_current_program, location);
-	assert(loc != NULL);
+	if (loc == NULL) return;
 	f_append(func, strlen(loc->name), loc->name);
 	f_append(func, sizeof(GLboolean), &transpose);
 	f_append(func, sizeof(GLint) * count * 4 * 4, (void *)value);
@@ -1700,6 +1880,18 @@ typedef struct tuio_cursor_s {
 } tuio_cursor_t;
 static int mouse_down = 0;
 
+int gl_symbol_search(const char *name) {
+	char **sym = gl_symbols;
+	int index = 0;
+	while ( sym != NULL ) {
+		if ( strcmp(*sym, name) == 0 )
+			return index;
+		index++;
+		sym++;
+	}
+	return -1;
+}
+
 static int
 callback_glproxy(
 	struct libwebsocket_context * this,
@@ -1723,6 +1915,11 @@ callback_glproxy(
 		case LWS_CALLBACK_CLIENT_ESTABLISHED:
 			break;
 
+		case LWS_CALLBACK_CLOSED:
+			printf("Client disconnected, end.\n");
+			do_exit = 1;
+			return 1;
+
 		case LWS_CALLBACK_RECEIVE:
 			//printf("--> (%d) \"%.*s\"\n", (int)len, (int)len, (char *)in);
 			//hexdump(in, len);
@@ -1742,6 +1939,11 @@ callback_glproxy(
 					mouse_down = 0;
 					lo_send(tuio_address, "/tuio/2Dcur", "s", "alive");
 					break;
+				case 99: // init message
+					viewport_width = c->x;
+					viewport_height = c->y;
+					pthread_mutex_unlock(&viewport_mutex);
+					return 0;
 			}
 
 			/**
@@ -1753,8 +1955,8 @@ callback_glproxy(
 			if ( mouse_down ) {
 				lo_send(tuio_address, "/tuio/2Dcur", "si", "alive", 1);
 				lo_send(tuio_address, "/tuio/2Dcur", "siff", "set", 1,
-						(float)c->x / 640.0f,
-						(float)c->y / 480.0f);
+						(float)c->x / (float)(viewport_width),
+						(float)c->y / (float)(viewport_height));
 			}
 			break;
 
@@ -1772,7 +1974,7 @@ callback_glproxy(
 				// pass to calculate the size of the final buffer
 				//size = LWS_SEND_BUFFER_PRE_PADDING + LWS_SEND_BUFFER_POST_PADDING;
 				// name
-				size = strlen(func->name) + 1;
+				size = sizeof(int);
 				// number of args
 				size += sizeof(int);
 				arg = func->args;
@@ -1787,16 +1989,18 @@ callback_glproxy(
 
 				//printf("==> %s state 2, size is %d\n", func->name, size);
 				// create the buffer
-				buf = calloc(size + LWS_SEND_BUFFER_PRE_PADDING + LWS_SEND_BUFFER_POST_PADDING, 1);
+				buf = _new(char, size);
 				if ( buf == NULL ) {
 					printf("FATAL: unable to allocate ws buffer\n");
-					return -1;
+					return 1;
 				}
 
 				// fill the buffer
-				abuf = &buf[LWS_SEND_BUFFER_PRE_PADDING];
-				memcpy(abuf, func->name, strlen(func->name) + 1);
-				abuf += strlen(func->name) + 1;
+				abuf = buf;
+				int symbol_index = gl_symbol_search(func->name);
+				assert(symbol_index >= 0);
+				memcpy(abuf, &symbol_index, sizeof(symbol_index));
+				abuf += sizeof(symbol_index);
 				memcpy(abuf, &argc, sizeof(argc));
 				abuf += sizeof(argc);
 				arg = func->args;
@@ -1809,13 +2013,20 @@ callback_glproxy(
 				}
 
 				// serialize and send to socket
-				//printf("==> sending %s with %u data\n", func->name, size);
 				//hexdump(buf, size);
-				n = libwebsocket_write(wsi, (unsigned char *)&buf[LWS_SEND_BUFFER_PRE_PADDING], size, LWS_WRITE_BINARY);
+				byte *out = lzw_encode(buf, 12);
+
+				// that should be avoided...
+				byte *outpadded = _new(char, _len(out) + LWS_SEND_BUFFER_PRE_PADDING + LWS_SEND_BUFFER_POST_PADDING);
+				memcpy(&outpadded[LWS_SEND_BUFFER_PRE_PADDING], out, _len(out));
+
+				n = libwebsocket_write(wsi, (unsigned char *)&outpadded[LWS_SEND_BUFFER_PRE_PADDING], _len(out), LWS_WRITE_BINARY);
 				//printf("    <-- n was %u (%u)\n", n, (abuf - buf));
 
 				f_free(func);
-				free(buf);
+				_del(out);
+				_del(outpadded);
+				_del(buf);
 			}
 
 
@@ -1841,7 +2052,6 @@ static struct libwebsocket_protocols protocols[] = {
 };
 
 void *ws_thread(void *arg) {
-	struct libwebsocket_context *context;
 	int n = 0;
     tuio_address = lo_address_new(NULL, "7770");
 
@@ -1853,7 +2063,7 @@ void *ws_thread(void *arg) {
 		exit(1);
 	}
 
-	while (n >= 0) {
+	while (n >= 0 && do_exit == 0) {
 		n = libwebsocket_service(context, 5);
 
 		pthread_mutex_lock(&qfuncmtx);
@@ -1864,6 +2074,9 @@ void *ws_thread(void *arg) {
 	}
 
 	libwebsocket_context_destroy(context);
+
+	printf("END REACH.\n");
+	kill(0, SIGTERM);
 
 	return 0;
 }
